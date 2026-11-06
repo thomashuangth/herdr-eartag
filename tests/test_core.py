@@ -6,6 +6,10 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
+# Never read or write the real ~/.claude*, ~/.codex or ~/.gemini from a test.
+os.environ["HOME"] = tempfile.mkdtemp(prefix="eartag-home-")
+os.environ.pop("CLAUDE_CONFIG_DIR", None)
+
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from herdr_eartag import claude, gitinfo, render, statusline, textutil  # noqa: E402
@@ -445,6 +449,93 @@ class ColorTests(unittest.TestCase):
                         reply_verdict="DONE", reply_verdict_label="DONE")
         text = "".join(t for l in render.render(v).lines for t, _ in l)
         self.assertTrue(all(ord(c) < 128 for c in text), text)
+
+
+    def test_inferred_session_matches_the_terminal_title(self):
+        home = Path(os.environ["HOME"])
+        cwd = "/w/proj"
+        made = []
+        for i, (folder, title) in enumerate(((".claude", "Older one"), (".claude-work", "Login rework"),
+                                             (".claude-work", ""))):
+            d = home / folder / "projects" / claude.encode_project_dir(cwd)
+            d.mkdir(parents=True, exist_ok=True)
+            path = d / "s{}.jsonl".format(i)
+            path.write_text((_rec("ai-title", aiTitle=title) + "\n") if title else _user("hi") + "\n")
+            os.utime(path, (1000 + i, 1000 + i))
+            made.append(path)
+        try:
+            self.assertEqual(claude.find_transcript(None, cwd, "Login rework")[0], made[1])
+            self.assertEqual(claude.find_transcript(None, cwd, "Older one")[0], made[0])
+            self.assertEqual(claude.find_transcript(None, cwd, "Claude Code")[0], made[2])
+            self.assertEqual(claude.find_transcript(None, cwd, "")[0], made[2])
+            self.assertEqual(claude.config_dir_of(made[1]).name, ".claude-work")
+            self.assertEqual(claude.find_transcript("s1", None)[0], made[1])
+        finally:
+            import shutil
+            shutil.rmtree(home / ".claude", ignore_errors=True)
+            shutil.rmtree(home / ".claude-work", ignore_errors=True)
+
+
+class OtherAgentTests(unittest.TestCase):
+    def _write(self, lines):
+        tmp = tempfile.mkdtemp()
+        path = Path(tmp) / "t.jsonl"
+        path.write_text("\n".join(json.dumps(l) for l in lines) + "\n")
+        return path
+
+    def test_antigravity_transcript(self):
+        from herdr_eartag import antigravity
+        path = self._write([
+            {"type": "USER_INPUT", "source": "USER_EXPLICIT", "created_at": "2026-11-06T19:32:19Z",
+             "content": "<USER_REQUEST>\nMake the calendar a tool\n</USER_REQUEST>\n<ADDITIONAL_METADATA>x"},
+            {"type": "PLANNER_RESPONSE", "source": "MODEL", "created_at": "2026-11-06T19:33:00Z",
+             "input_tokens": 100, "cache_read_tokens": 900,
+             "tool_calls": [{"name": "edit_file", "args": {"Path": json.dumps("/p/secret/maquettes.py")}},
+                            {"name": "read_file", "args": {"Path": json.dumps("/p/other.py")}},
+                            {"name": "run_command", "args": {"CommandLine": json.dumps("git status --short")}}]},
+            {"type": "PLANNER_RESPONSE", "source": "MODEL", "created_at": "2026-11-06T19:34:00Z",
+             "content": "Done: the calendar is a tool."},
+        ])
+        t = antigravity.AgyTranscript(path)
+        t.refresh()
+        d = t.data
+        self.assertEqual([a.text for a in d.asks], ["Make the calendar a tool"])
+        self.assertEqual(list(d.files), ["maquettes.py"])
+        self.assertEqual(d.last_tool, "run_command git")
+        self.assertEqual(d.context_tokens, 1000)
+        self.assertEqual(d.last_reply, "Done: the calendar is a tool.")
+        self.assertEqual(antigravity.effort_of("Gemini 3.8 Flash (Low)"), "low")
+
+    def test_codex_rollout(self):
+        from herdr_eartag import codex
+        ask = {"type": "UserMessage", "content": [{"type": "text", "text": "Fix the bar"}]}
+        path = self._write([
+            {"timestamp": "2026-10-25T18:04:10Z", "type": "turn_context",
+             "payload": {"model": "gpt-6.1-sol", "effort": "low"}},
+            {"timestamp": "2026-10-25T18:04:10Z", "type": "event_msg",
+             "payload": {"type": "item_completed", "item": ask}},
+            {"timestamp": "2026-10-25T18:04:11Z", "type": "response_item",
+             "payload": {"type": "custom_tool_call", "name": "apply_patch",
+                         "input": "*** Begin Patch\n*** Update File: /p/src/bar.rs\n@@\n*** End Patch"}},
+            {"timestamp": "2026-10-25T18:04:12Z", "type": "event_msg",
+             "payload": {"type": "token_count",
+                         "info": {"last_token_usage": {"input_tokens": 47500}, "model_context_window": 475000},
+                         "rate_limits": {"primary": {"used_percent": 31.0, "window_minutes": 300, "resets_at": 1},
+                                         "secondary": {"used_percent": 18.0, "window_minutes": 10080}}}},
+            {"timestamp": "2026-10-25T18:04:13Z", "type": "event_msg",
+             "payload": {"type": "item_completed",
+                         "item": {"type": "AgentMessage", "content": [{"type": "Text", "text": "Fixed."}]}}},
+        ])
+        t = codex.CodexTranscript(path)
+        t.refresh()
+        d = t.data
+        self.assertEqual([a.text for a in d.asks], ["Fix the bar"])
+        self.assertEqual((d.model, d.effort), ("gpt-6.1-sol", "low"))
+        self.assertEqual(list(d.files), ["bar.rs"])
+        self.assertEqual((d.context_tokens, d.context_window), (47500, 475000))
+        self.assertEqual(d.rate_limits["rate_limits"]["five_hour"]["used_percentage"], 31.0)
+        self.assertEqual(d.rate_limits["rate_limits"]["seven_day"]["used_percentage"], 18.0)
+        self.assertEqual(d.last_reply, "Fixed.")
 
 
 class PanelModelTests(unittest.TestCase):

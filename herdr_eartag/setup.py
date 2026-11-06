@@ -1,4 +1,4 @@
-"""One-click setup: Claude Code statusline relay (quotas) and the prefix+i key.
+"""One-click setup: statusline relay (quotas) for Claude Code and Antigravity, and the prefix+i key.
 
 Both steps are idempotent, keep a backup of the file they edit, and can be undone.
 They run only when the user asks: the `setup` action, or the "Enable" line / menu
@@ -16,8 +16,8 @@ import tempfile
 from pathlib import Path
 from typing import Any, List, Optional
 
-from . import herdr, statusline
-from .config import claude_dir, data_dir, ensure_private_dir, herdr_config_path
+from . import antigravity, herdr, statusline
+from .config import claude_dir, claude_dirs, data_dir, ensure_private_dir, herdr_config_path
 
 PLUGIN_ID = "thomashuangth.eartag"
 KEY = "prefix+i"
@@ -30,12 +30,36 @@ def plugin_id() -> str:
 
 
 # -- statusline relay ---------------------------------------------------------------
+# One target per settings file: each Claude Code config dir, and Antigravity (agy).
+# Claude Code runs the statusline command through a shell; agy gets a one-line
+# wrapper script instead, so the command stays a plain path either way.
+
+class Target:
+    def __init__(self, kind: str, settings: Path, scope: str):
+        self.kind = kind          # "claude" | "agy"
+        self.settings = settings
+        self.scope = scope        # "" for ~/.claude
+
+    @property
+    def previous(self) -> Path:
+        name = "previous.json" if not self.scope else "previous-{}.json".format(self.scope)
+        return data_dir() / "statusline" / name
+
+
+def targets(kind: Optional[str] = None) -> List[Target]:
+    found: List[Target] = []
+    if kind in (None, "claude"):
+        for folder in claude_dirs():
+            found.append(Target("claude", folder / "settings.json", statusline.claude_scope(str(folder))))
+    if kind in (None, "agy"):
+        settings = antigravity.settings_path()
+        if settings.parent.is_dir():
+            found.append(Target("agy", settings, "agy"))
+    return found
+
+
 def _settings_path() -> Path:
     return claude_dir() / "settings.json"
-
-
-def _previous_path() -> Path:
-    return data_dir() / "statusline" / "previous.json"
 
 
 def tap_install_path() -> Path:
@@ -43,8 +67,12 @@ def tap_install_path() -> Path:
     return Path(base) / "herdr-eartag" / "statusline_tap.py"
 
 
-def _load_settings() -> Optional[dict]:
-    path = _settings_path()
+def agy_wrapper_path() -> Path:
+    return tap_install_path().with_name("agy_statusline.sh")
+
+
+def _load_settings(path: Optional[Path] = None) -> Optional[dict]:
+    path = path or _settings_path()
     if not path.exists():
         return {}
     try:
@@ -67,57 +95,103 @@ def _write_json_atomic(path: Path, data: Any) -> None:
     os.replace(tmp, path)
 
 
-def statusline_installed() -> bool:
-    settings = _load_settings() or {}
+def _is_relay(command: str) -> bool:
+    return "statusline_tap.py" in command or agy_wrapper_path().name in command
+
+
+def _target_installed(target: Target) -> bool:
+    settings = _load_settings(target.settings) or {}
     current = settings.get("statusLine")
-    return isinstance(current, dict) and "statusline_tap.py" in str(current.get("command", ""))
+    return isinstance(current, dict) and _is_relay(str(current.get("command", "")))
 
 
-def install_statusline() -> str:
-    settings = _load_settings()
-    path = _settings_path()
-    if settings is None:
-        return "Statusline: cannot read {}, nothing changed.".format(path)
+def statusline_installed(kind: Optional[str] = None) -> bool:
+    found = targets(kind)
+    return bool(found) and all(_target_installed(t) for t in found)
+
+
+def refresh_tap() -> None:
+    """Keep the installed relay in step with this plugin version (it is our own copy)."""
     tap = tap_install_path()
-    ensure_private_dir(tap.parent)
-    shutil.copyfile(Path(statusline.__file__), tap)
-    os.chmod(tap, 0o700)
-    if statusline_installed():
-        return "Statusline: relay already installed (refreshed)."
+    if not tap.exists():
+        return
+    try:
+        source = Path(statusline.__file__).read_bytes()
+        if tap.read_bytes() != source:
+            tap.write_bytes(source)
+    except OSError:
+        pass
+
+
+def _install_target(target: Target) -> str:
+    path = target.settings
+    label = "Antigravity" if target.kind == "agy" else str(path.parent)
+    settings = _load_settings(path)
+    if settings is None:
+        return "Statusline ({}): cannot read {}, nothing changed.".format(label, path)
+    if _target_installed(target):
+        return "Statusline ({}): relay already installed.".format(label)
     current = settings.get("statusLine")
-    previous = _previous_path()
+    previous = target.previous
     ensure_private_dir(previous.parent)
     previous.write_text(json.dumps({"statusLine": current}), encoding="utf-8")
     os.chmod(previous, 0o600)
     backup = path.with_name(path.name + ".herdr-eartag.bak")
     if path.exists() and not backup.exists():
         shutil.copyfile(path, backup)
+    tap = tap_install_path()
     command = "{} {}".format(shlex.quote(sys.executable or "python3"), shlex.quote(str(tap)))
-    new = dict(current) if isinstance(current, dict) else {"type": "command"}
-    if isinstance(current, dict) and current.get("type") == "command" and current.get("command"):
-        command += " --then " + shlex.quote(str(current["command"]))
-    new["type"] = "command"
-    new["command"] = command
+    prev_cmd = str(current.get("command") or "") if isinstance(current, dict) else ""
+    keeps = bool(prev_cmd) and (target.kind == "agy" or current.get("type") == "command")
+    if target.kind == "agy" and isinstance(current, dict) and current.get("enabled") is False:
+        keeps = False
+    if keeps:
+        command += " --then " + shlex.quote(prev_cmd)
+    new = dict(current) if isinstance(current, dict) else {}
+    if target.kind == "agy":
+        wrapper = agy_wrapper_path()
+        wrapper.write_text("#!/bin/sh\n# Eartag statusline relay for Antigravity.\nexec {}\n".format(command),
+                           encoding="utf-8")
+        os.chmod(wrapper, 0o700)
+        new.setdefault("type", "")
+        new["command"] = str(wrapper)
+        new["enabled"] = True
+    else:
+        new["type"] = "command"
+        new["command"] = command
     settings["statusLine"] = new
     _write_json_atomic(path, settings)
-    kept = " Your statusline still runs as before." if isinstance(current, dict) and current.get("command") else ""
-    return "Statusline: relay added to {}.{}".format(path, kept)
+    kept = " Your statusline still runs as before." if keeps else ""
+    return "Statusline ({}): relay added to {}.{}".format(label, path, kept)
 
 
-def remove_statusline() -> str:
-    settings = _load_settings()
-    if settings is None or not statusline_installed():
-        return "Statusline: relay not installed."
+def install_statusline() -> str:
+    tap = tap_install_path()
+    ensure_private_dir(tap.parent)
+    shutil.copyfile(Path(statusline.__file__), tap)
+    os.chmod(tap, 0o700)
+    return "\n".join(_install_target(t) for t in targets())
+
+
+def _remove_target(target: Target) -> str:
+    label = "Antigravity" if target.kind == "agy" else str(target.settings.parent)
+    settings = _load_settings(target.settings)
+    if settings is None or not _target_installed(target):
+        return "Statusline ({}): relay not installed.".format(label)
     try:
-        previous = json.loads(_previous_path().read_text(encoding="utf-8"))
+        previous = json.loads(target.previous.read_text(encoding="utf-8"))
     except (OSError, ValueError):
         previous = {"statusLine": None}
     if previous.get("statusLine"):
         settings["statusLine"] = previous["statusLine"]
     else:
         settings.pop("statusLine", None)
-    _write_json_atomic(_settings_path(), settings)
-    return "Statusline: previous statusline restored."
+    _write_json_atomic(target.settings, settings)
+    return "Statusline ({}): previous statusline restored.".format(label)
+
+
+def remove_statusline() -> str:
+    return "\n".join(_remove_target(t) for t in targets())
 
 
 # -- keybinding ---------------------------------------------------------------------
@@ -184,8 +258,8 @@ def _reload_herdr() -> None:
 
 
 # -- all -----------------------------------------------------------------------------
-def needs_setup() -> bool:
-    return not statusline_installed() or keybinding_state() == "missing"
+def needs_setup(kind: Optional[str] = None) -> bool:
+    return not statusline_installed(kind) or keybinding_state() == "missing"
 
 
 def run_all() -> List[str]:

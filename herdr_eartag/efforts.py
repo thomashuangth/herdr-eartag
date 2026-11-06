@@ -54,7 +54,12 @@ def display_name(model_id: str) -> Tuple[str, str]:
     if not model_id:
         return "", ""
     mid = model_id.split("[", 1)[0].strip()
-    low = mid.lower()
+    # Antigravity names models for people: 'Gemini 3.8 Flash (Low)', 'Claude Sonnet 4.6 (Thinking)'.
+    mid = re.sub(r"\s*\([^)]*\)\s*$", "", mid)
+    low = re.sub(r"\s+", "-", mid.lower())
+    m = re.match(r"^(?:claude-)?(opus|sonnet|haiku|fable)-(\d+)\.(\d+)", low)
+    if m:
+        return m.group(1).capitalize(), m.group(2) + "." + m.group(3)
     m = re.match(r"^gpt-?(\d+(?:\.\d+)?)", low)
     if m:
         return "GPT", m.group(1)

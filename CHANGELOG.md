@@ -1,5 +1,17 @@
 # Changelog
 
+## Unreleased
+
+- Several Claude Code accounts (`CLAUDE_CONFIG_DIR` aliases such as `claude-lb`):
+  transcripts and tasks are found in `~/.claude`, `~/.claude-*` and the new
+  `claude_dirs` key; setup installs the relay in each dir and quotas are kept per
+  account. Without a herdr session id, agents in the same folder are told apart by
+  the pane title.
+- Antigravity (`agy`): full panel from its transcript, model and effort, context
+  and quotas through its statusline (setup wraps it like Claude Code's).
+- Codex: full panel from its session files, with context and 5h/7d quotas.
+- The installed relay is refreshed when a panel starts after an update.
+
 ## 0.1.0
 
 First public release.

@@ -22,8 +22,10 @@ whether it is done, plus context and quota left.
   reset time, shown in place without moving anything), machine, branch, model and
   effort.
 - **Model and effort** on each family's own scale (Claude 5 levels, OpenAI 5,
-  Gemini and Grok 2), colored cool for low, gold for high, red for max. Codex
-  agents show their model and reasoning effort too.
+  Gemini and Grok 2), colored cool for low, gold for high, red for max.
+- **Claude Code, Codex and Antigravity** (`agy`) all get the full panel, including
+  several Claude Code accounts side by side (`CLAUDE_CONFIG_DIR=~/.claude-work claude`),
+  each with its own quotas.
 
 ![Done, waiting for you, failed](docs/states.png)
 
@@ -41,7 +43,8 @@ an ASCII mode. Hover or click a gauge to see when it resets.
 
 herdr 0.9.3+ on macOS or Linux, and Python 3.9+ (already there on macOS and
 most Linux distributions; nothing to `pip install`). The full panel is for Claude
-Code; other agents get their state, branch and the files changed in git.
+Code, Codex and Antigravity; other agents get their state, branch and the files
+changed in git.
 
 ## Install
 
@@ -54,9 +57,11 @@ That's it: a panel now opens on the right of every new agent.
 The first time, click **▸ Enable quotas + prefix+i** at the bottom of a panel.
 This one click:
 
-- puts a small relay in front of your Claude Code statusline, so the panel gets
-  the 5h/7d quotas and the exact context (your statusline keeps running and
-  printing as before; `~/.claude/settings.json` is backed up first);
+- puts a small relay in front of your Claude Code statusline (in `~/.claude` and
+  every other Claude config dir, such as `~/.claude-work`) and your Antigravity
+  statusline, so the panel gets the 5h/7d quotas and the exact context (your
+  statusline keeps running and printing as before; each `settings.json` is backed
+  up first). Codex needs nothing: its quotas are in its session files;
 - binds `prefix+i` to show or hide the panel, if that key is free (your herdr
   `config.toml` is backed up first, and herdr reloads it).
 
@@ -103,6 +108,16 @@ with comments. Changes apply to panels opened afterwards.
 | `host_label` | | footer machine name (default: `Mac` on macOS, short hostname elsewhere) |
 | `summarize` | `off` | `auto`, `claude`, `codex` or `gemini`: see below |
 | `summarize_model` | | empty = `haiku` for claude, the CLI's default for codex and gemini |
+| `claude_dirs` | | extra Claude Code config dirs, comma separated (`~/.claude` and `~/.claude-*` are found without it) |
+
+### Several Claude Code accounts
+
+The panel runs in herdr's environment, not your agent's, so it cannot see the
+`CLAUDE_CONFIG_DIR` of an alias like `claude-work`. It looks in `~/.claude`, every
+`~/.claude-*` or `~/.claude_*` dir holding transcripts, and `claude_dirs`. For
+herdr to tell each agent's session apart, install its Claude integration for that
+dir too: `CLAUDE_CONFIG_DIR=~/.claude-work herdr integration install claude`.
+Without it, Eartag matches the session by the pane's title.
 
 ## Rephrasing with an LLM
 
@@ -142,7 +157,7 @@ provider.
 
 With `summarize = off`, nothing leaves your machine: no network calls, no telemetry.
 
-- The panel reads Claude Code transcripts locally, tail only, and shows file
+- The panel reads Claude Code, Codex and Antigravity transcripts locally, tail only, and shows file
   **basenames** and program names (never full paths, command arguments or tool
   inputs).
 - The statusline relay stores a whitelist: session id, model, effort, context

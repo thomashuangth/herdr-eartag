@@ -15,7 +15,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
-from .config import claude_dir
+from .config import claude_dir, claude_dirs
 
 INITIAL_TAIL = 4 * 1024 * 1024
 BACKFILL_CHUNK = 8 * 1024 * 1024
@@ -178,6 +178,8 @@ class SessionData:
     todos: Optional[Tuple[int, int, str]] = None
     last_reply: str = ""                  # latest assistant text after the current ask
     last_reply_ts: Optional[float] = None
+    context_window: Optional[int] = None  # when the transcript states it (Codex)
+    rate_limits: Optional[dict] = None     # statusline format, when the transcript has them (Codex)
 
 
 class Transcript:
@@ -252,18 +254,8 @@ class Transcript:
             files: List[Tuple[str, float]] = []
             for line in blob.splitlines():
                 obj = _loads(line)
-                if obj is None:
-                    continue
-                text = prompt_from_record(obj)
-                if text:
-                    found.append(Ask(parse_ts(obj.get("timestamp")) or 0.0, text))
-                elif obj.get("type") == "assistant" and not obj.get("isSidechain"):
-                    ts = parse_ts(obj.get("timestamp")) or 0.0
-                    for name, params in _tool_uses(obj):
-                        if name in FILE_TOOLS:
-                            path = params.get("file_path") or params.get("notebook_path")
-                            if isinstance(path, str):
-                                files.append((os.path.basename(path), ts))
+                if obj is not None:
+                    self._scan_older(obj, found, files)
             older = found + older
             for name, ts in files:
                 if name not in self.data.files:
@@ -273,7 +265,44 @@ class Transcript:
         if older:
             self.data.asks = (older + self.data.asks)[-KEEP_ASKS:]
 
-    # -- parsing -----------------------------------------------------------
+    # -- parsing (overridden by the readers of other agents) ----------------
+    def _scan_older(self, obj: dict, asks: List[Ask], files: List[Tuple[str, float]]) -> None:
+        """Backfill: collect asks and edited files from a record older than the tail."""
+        text = prompt_from_record(obj)
+        if text:
+            asks.append(Ask(parse_ts(obj.get("timestamp")) or 0.0, text))
+        elif obj.get("type") == "assistant" and not obj.get("isSidechain"):
+            ts = parse_ts(obj.get("timestamp")) or 0.0
+            for name, params in _tool_uses(obj):
+                if name in FILE_TOOLS:
+                    path = params.get("file_path") or params.get("notebook_path")
+                    if isinstance(path, str):
+                        files.append((os.path.basename(path), ts))
+
+    def _new_ask(self, ts: Optional[float], text: str) -> None:
+        d = self.data
+        d.asks.append(Ask(ts or 0.0, text))
+        del d.asks[:-KEEP_ASKS]
+        d.last_tool = ""
+        d.last_tool_ts = None
+        d.last_reply = ""
+        d.last_reply_ts = None
+        d.last_activity_ts = ts or d.last_activity_ts
+
+    def _reply_text(self, ts: Optional[float], text: str) -> None:
+        d = self.data
+        d.last_reply = text[-4000:]
+        d.last_reply_ts = ts
+        if d.asks:
+            d.asks[-1].reply = d.last_reply
+            d.asks[-1].reply_ts = ts
+
+    def _edited(self, path: str, ts: Optional[float]) -> None:
+        base = os.path.basename(path)
+        if base:
+            self.data.files[base] = ts or 0.0
+            self.data.files.move_to_end(base)
+
     def _ingest_line(self, line: bytes) -> None:
         obj = _loads(line)
         if obj is None:
@@ -284,14 +313,7 @@ class Transcript:
         if kind == "user":
             text = prompt_from_record(obj)
             if text:
-                ask = Ask(ts or 0.0, text)
-                d.asks.append(ask)
-                del d.asks[:-KEEP_ASKS]
-                d.last_tool = ""
-                d.last_tool_ts = None
-                d.last_reply = ""
-                d.last_reply_ts = None
-                d.last_activity_ts = ts or d.last_activity_ts
+                self._new_ask(ts, text)
         elif kind == "assistant":
             if obj.get("isSidechain"):
                 return
@@ -315,20 +337,14 @@ class Transcript:
                 d.last_activity_ts = ts
             text = _assistant_text(obj)
             if text:
-                d.last_reply = text[-4000:]
-                d.last_reply_ts = ts
-                if d.asks:
-                    d.asks[-1].reply = d.last_reply
-                    d.asks[-1].reply_ts = ts
+                self._reply_text(ts, text)
             for name, params in _tool_uses(obj):
                 d.last_tool = tool_label(name, params)
                 d.last_tool_ts = ts
                 if name in FILE_TOOLS:
                     path = params.get("file_path") or params.get("notebook_path")
                     if isinstance(path, str) and path:
-                        base = os.path.basename(path)
-                        d.files[base] = ts or 0.0
-                        d.files.move_to_end(base)
+                        self._edited(path, ts)
                 if name == "TodoWrite":
                     todos = params.get("todos")
                     if isinstance(todos, list):
@@ -381,36 +397,94 @@ def _tool_uses(obj: dict):
 _glob_cache: Dict[str, Optional[Path]] = {}
 
 
-def find_transcript(session_id: Optional[str], cwd: Optional[str]) -> Tuple[Optional[Path], bool]:
-    """Return (path, inferred). inferred=True when herdr gave no session id."""
-    base = claude_dir() / "projects"
+def config_dir_of(transcript: Path) -> Path:
+    """<config dir>/projects/<cwd>/<id>.jsonl -> <config dir>"""
+    return transcript.parent.parent.parent
+
+
+def find_transcript(session_id: Optional[str], cwd: Optional[str],
+                    title: str = "") -> Tuple[Optional[Path], bool]:
+    """Return (path, inferred). inferred=True when herdr gave no session id.
+
+    Looks in every Claude config dir (see config.claude_dirs). Without a session id
+    (herdr's session hook is not installed for that config dir), several agents in
+    the same folder are told apart by the pane's terminal title, which Claude Code
+    sets to the session's AI title."""
+    bases = [d / "projects" for d in claude_dirs()]
     if session_id and re.fullmatch(r"[A-Za-z0-9_-]+", session_id):
-        if cwd:
-            direct = base / encode_project_dir(cwd) / "{}.jsonl".format(session_id)
-            if direct.exists():
-                return direct, False
         cached = _glob_cache.get(session_id)
         if cached and cached.exists():
             return cached, False
-        for found in base.glob("*/{}.jsonl".format(session_id)):
-            _glob_cache[session_id] = found
-            return found, False
+        if cwd:
+            for base in bases:
+                direct = base / encode_project_dir(cwd) / "{}.jsonl".format(session_id)
+                if direct.exists():
+                    _glob_cache[session_id] = direct
+                    return direct, False
+        for base in bases:
+            for found in base.glob("*/{}.jsonl".format(session_id)):
+                _glob_cache[session_id] = found
+                return found, False
         return None, False
     if not cwd:
         return None, True
-    folder = base / encode_project_dir(cwd)
-    try:
-        newest = max(folder.glob("*.jsonl"), key=lambda p: p.stat().st_mtime)
-    except (ValueError, OSError):
+    candidates: List[Tuple[float, Path]] = []
+    for base in bases:
+        try:
+            for path in (base / encode_project_dir(cwd)).glob("*.jsonl"):
+                candidates.append((path.stat().st_mtime, path))
+        except OSError:
+            continue
+    if not candidates:
         return None, True
-    return newest, True
+    candidates.sort(reverse=True)
+    title = (title or "").strip()
+    if title:
+        recent = [p for _, p in candidates[:20]]
+        generic = title.lower() in ("claude code", "claude")
+        for path in recent:
+            found = last_ai_title(path)
+            if (generic and not found) or (not generic and found == title):
+                return path, True
+    return candidates[0][1], True
 
 
-def read_tasks(session_id: Optional[str]) -> Optional[Tuple[int, int, str]]:
-    """Claude Code task list (~/.claude/tasks/<session>/*.json): (completed, total, current)."""
+_title_cache: Dict[Tuple[str, int], str] = {}
+
+
+def last_ai_title(path: Path) -> str:
+    """Latest ai-title of a transcript (its tail only), '' when it has none yet."""
+    try:
+        size = path.stat().st_size
+    except OSError:
+        return ""
+    key = (str(path), size)
+    if key in _title_cache:
+        return _title_cache[key]
+    title = ""
+    try:
+        with open(path, "rb") as fh:
+            fh.seek(max(0, size - 512 * 1024))
+            blob = fh.read()
+    except OSError:
+        return ""
+    for line in reversed(blob.splitlines()):
+        if b'"ai-title"' in line:
+            obj = _loads(line)
+            if obj and isinstance(obj.get("aiTitle"), str):
+                title = obj["aiTitle"]
+                break
+    if len(_title_cache) > 200:
+        _title_cache.clear()
+    _title_cache[key] = title
+    return title
+
+
+def read_tasks(session_id: Optional[str], base: Optional[Path] = None) -> Optional[Tuple[int, int, str]]:
+    """Claude Code task list (<config dir>/tasks/<session>/*.json): (completed, total, current)."""
     if not session_id or not re.fullmatch(r"[A-Za-z0-9_-]+", session_id):
         return None
-    folder = claude_dir() / "tasks" / session_id
+    folder = (base or claude_dir()) / "tasks" / session_id
     if not folder.is_dir():
         return None
     done = total = 0

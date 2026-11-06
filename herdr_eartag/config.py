@@ -7,7 +7,7 @@ import socket
 import sys
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional
+from typing import List, Optional
 
 DEFAULT_CONFIG = """\
 # herdr-eartag configuration. Lines starting with # are comments.
@@ -36,6 +36,9 @@ host_label =
 summarize = off
 # Empty = haiku for claude, the CLI's own default model for codex and gemini.
 summarize_model =
+# Extra Claude Code config dirs (CLAUDE_CONFIG_DIR of other accounts), comma
+# separated. ~/.claude and ~/.claude-* are found without this.
+claude_dirs =
 # Key shown in the "hidden" toast. Bind it yourself in herdr config.toml.
 toggle_key = prefix+i
 """
@@ -64,6 +67,54 @@ def config_dir() -> Path:
 def claude_dir() -> Path:
     env = os.environ.get("CLAUDE_CONFIG_DIR")
     return Path(env) if env else _home() / ".claude"
+
+
+def claude_dirs() -> List[Path]:
+    """Every Claude Code config dir on this machine, default first.
+
+    Several accounts are often run side by side with an alias such as
+    `CLAUDE_CONFIG_DIR=~/.claude-work claude`. The panel runs in herdr's environment,
+    not the agent's, so it cannot see that variable: it looks at ~/.claude, any
+    ~/.claude-* or ~/.claude_* dir that holds transcripts, CLAUDE_CONFIG_DIR, and the
+    `claude_dirs` config key (comma separated) for dirs elsewhere."""
+    found: List[Path] = []
+    seen = set()
+
+    def add(path: Path) -> None:
+        path = path.expanduser()
+        try:
+            real = path.resolve()
+        except OSError:
+            return
+        if real.is_dir() and real not in seen:
+            seen.add(real)
+            found.append(path)
+
+    add(_home() / ".claude")
+    env = os.environ.get("CLAUDE_CONFIG_DIR")
+    if env:
+        add(Path(env))
+    try:
+        siblings = sorted(_home().glob(".claude[-_]*"))
+    except OSError:
+        siblings = []
+    for path in siblings:
+        if (path / "projects").is_dir():
+            add(path)
+    for extra in _extra_claude_dirs():
+        add(Path(extra))
+    return found
+
+
+def _extra_claude_dirs() -> List[str]:
+    path = config_dir() / "config.ini"
+    parser = configparser.ConfigParser(inline_comment_prefixes=("#", ";"))
+    try:
+        parser.read(path, encoding="utf-8")
+        value = parser.get("eartag", "claude_dirs", fallback="")
+    except (OSError, configparser.Error):
+        return []
+    return [v.strip() for v in value.split(",") if v.strip()]
 
 
 def herdr_config_path() -> Path:

@@ -9,7 +9,7 @@ import sys
 from typing import Any, Iterator, Optional
 
 from . import herdr, prefs
-from .config import Config, claude_dir, config_dir, ensure_private_dir, load_config, state_dir
+from .config import Config, config_dir, ensure_private_dir, load_config, state_dir
 from .i18n import Tr, detect_language
 from .setup import plugin_id as setup_plugin_id
 
@@ -188,6 +188,8 @@ def cmd_panel(args) -> int:
     me = os.environ.get("HERDR_PANE_ID") if os.environ.get("HERDR_PLUGIN_ENTRYPOINT_ID") == "panel" else None
     if me == target:
         me = None
+    from . import setup
+    setup.refresh_tap()
     return App(target, me, cfg, _tr(cfg)).run()
 
 
@@ -258,7 +260,9 @@ def cmd_doctor(args) -> int:
     from . import setup
     print("statusline  ", "relay installed" if setup.statusline_installed() else "relay missing (run setup)")
     print("key         ", setup.KEY, setup.keybinding_state())
-    print("claude dir  ", claude_dir(), "(exists)" if claude_dir().exists() else "(missing)")
+    for target in setup.targets():
+        print("relay       ", target.kind, target.settings,
+              "installed" if setup._target_installed(target) else "missing (run setup)")
     print("language    ", cfg.language, "->", _tr(cfg).lang)
     try:
         agents = herdr.agent_list()

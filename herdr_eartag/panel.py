@@ -7,7 +7,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-from . import claude, codex, efforts, gitinfo, herdr, prefs, statusline, textutil
+from . import antigravity, claude, codex, efforts, gitinfo, herdr, prefs, statusline, textutil
 from .config import Config
 from .i18n import Tr
 from .render import Bar, View
@@ -21,6 +21,17 @@ MODE_TAGS = {
     "default": "normal", "auto": "auto", "plan": "plan",
     "acceptEdits": "edits", "bypassPermissions": "bypass", "dontAsk": "dontask",
 }
+
+
+# Agents whose sessions Eartag reads (asks, replies, files, context, quotas).
+READ_AGENTS = ("claude", "codex", "agy")
+# Agents whose statusline the relay taps (model, effort, context, quotas).
+TAPPED_AGENTS = ("claude", "agy")
+
+
+def agent_kind(agent: str) -> str:
+    agent = (agent or "").lower()
+    return "agy" if agent in antigravity.AGENTS else agent
 
 
 def short_tokens(n: float) -> str:
@@ -46,6 +57,7 @@ class PanelModel:
         self.pane: Optional[Dict[str, Any]] = None
         self.pane_missing = False
         self.transcript: Optional[claude.Transcript] = None
+        self.claude_base: Optional[Path] = None  # config dir the Claude transcript lives in
         self.inferred = False
         self.git: Optional[gitinfo.GitInfo] = None
         self.agents: List[Dict[str, Any]] = []
@@ -81,6 +93,14 @@ class PanelModel:
         return str((self.pane or {}).get("agent") or "")
 
     @property
+    def kind(self) -> str:
+        return agent_kind(self.agent)
+
+    @property
+    def reads(self) -> bool:
+        return self.kind in READ_AGENTS
+
+    @property
     def cwd(self) -> Optional[str]:
         pane = self.pane or {}
         return pane.get("foreground_cwd") or pane.get("cwd")
@@ -114,8 +134,8 @@ class PanelModel:
                 self.status_since = now
                 changed = True
             changed |= self._poll_transcript()
-            snap = statusline.read_session(self.session_id) if self.agent == "claude" else None
-            rate = statusline.read_rate_limits() if self.agent == "claude" else None
+            snap = statusline.read_session(self._session_key()) if self.kind in TAPPED_AGENTS else None
+            rate = self._read_rate()
             if snap != self.session_snap or rate != self.rate_snap:
                 self.session_snap, self.rate_snap = snap, rate
                 changed = True
@@ -127,18 +147,49 @@ class PanelModel:
             changed = True
         return changed
 
+    def _session_key(self) -> Optional[str]:
+        """Session id for the relay's snapshots (the transcript's own id when herdr gave none)."""
+        if self.session_id:
+            return self.session_id
+        if self.transcript is None:
+            return None
+        path = self.transcript.path
+        return path.parents[2].name if self.kind == "agy" else path.stem
+
+    def _read_rate(self) -> Optional[Dict[str, Any]]:
+        if self.kind == "claude":
+            base = str(self.claude_base) if self.claude_base else None
+            return statusline.read_rate_limits(statusline.claude_scope(base))
+        if self.kind == "agy":
+            return statusline.read_rate_limits("agy")
+        if self.kind == "codex" and self.transcript is not None:
+            return self.transcript.data.rate_limits
+        return None
+
     def _poll_transcript(self) -> bool:
-        if self.agent != "claude":
+        kind = self.kind
+        if kind not in READ_AGENTS:
             if self.transcript is not None:
                 self.transcript = None
                 return True
             return False
-        path, inferred = claude.find_transcript(self.session_id, self.cwd)
+        reader = claude.Transcript
+        if kind == "claude":
+            title = str((self.pane or {}).get("terminal_title_stripped") or "")
+            path, inferred = claude.find_transcript(self.session_id, self.cwd, title)
+            self.claude_base = claude.config_dir_of(path) if path else None
+        elif kind == "agy":
+            path, inferred = antigravity.find_transcript(self.session_id, self.cwd)
+            reader = antigravity.AgyTranscript
+        else:
+            path = codex.find_session(self.session_id, self.cwd)
+            inferred = not self.session_id
+            reader = codex.CodexTranscript
         self.inferred = inferred and path is not None
         if path is None:
             return False
         if self.transcript is None or self.transcript.path != path:
-            self.transcript = claude.Transcript(path)
+            self.transcript = reader(path)
         return self.transcript.refresh()
 
     def _poll_slow(self) -> bool:
@@ -148,16 +199,16 @@ class PanelModel:
             self.agents = herdr.agent_list()
         except herdr.HerdrError:
             pass
-        self.tasks = claude.read_tasks(self.session_id) if self.agent == "claude" else None
-        if self.agent and self.agent != "claude" and self.git:
+        self.tasks = claude.read_tasks(self._session_key(), self.claude_base) if self.kind == "claude" else None
+        if self.agent and not self.reads and self.git:
             self.git_files = gitinfo.changed_files(self.git.root)
         else:
             self.git_files = []
         self.others = self._others_on_branch()
         self.diff = gitinfo.diff_stat(self.git.root) if self.git else None
-        if self.agent == "claude":
+        if self.kind in TAPPED_AGENTS:
             from . import setup
-            self.needs_setup = setup.needs_setup()
+            self.needs_setup = setup.needs_setup(self.kind)
         return before != (self.git, self.others, self.tasks, self.git_files, self.diff)
 
     # -- helpers -----------------------------------------------------------------
@@ -236,7 +287,7 @@ class PanelModel:
         status = self.status if self.status in ("working", "blocked", "done", "idle") else "unknown"
         v.status = status
         v.status_label = tr("status." + status)
-        if data and data.permission_mode:
+        if data and data.permission_mode and self.kind == "claude":
             v.mode_tag = MODE_TAGS.get(data.permission_mode, data.permission_mode)
 
         snap = self.session_snap or {}
@@ -261,9 +312,9 @@ class PanelModel:
 
         # Bars
         # Only show gauges that have a value: an empty "—" bar says nothing.
-        v.bars = [b for b in (self._bars(data, now) if self.agent == "claude" else []) if b.pct is not None]
+        v.bars = [b for b in (self._bars(data, now) if self.reads else []) if b.pct is not None]
         v.selected_bar = selected_bar
-        if self.agent == "claude":
+        if self.reads:
             if self.needs_setup:
                 v.footnote_icon = "now"
                 v.footnote = tr("setup_line")
@@ -271,7 +322,7 @@ class PanelModel:
             elif self.rate_snap and now - float(self.rate_snap.get("ts", now)) > STALE_QUOTAS:
                 v.footnote_icon = "stale"
                 v.footnote = tr("stale_quotas", d=self._ago(float(self.rate_snap["ts"]), now))
-            elif not self.session_snap and not self.rate_snap:
+            elif not self.session_snap and not self.rate_snap and self.kind in TAPPED_AGENTS:
                 # Relay installed, but Claude has not refreshed its statusline yet.
                 v.footnote = tr("quotas_after_reply")
 
@@ -289,16 +340,17 @@ class PanelModel:
             v.main_kind = "none"
             v.message_lines = [tr("no_agent")]
             return v
-        if self.agent != "claude":
+        if self.kind != "claude":
+            model_id, effort = self._other_agent_model(data)
+            v.model, v.version = efforts.display_name(model_id) if model_id else (self.agent.capitalize(), "")
+            v.effort = effort
+            v.effort_level = efforts.dots(model_id, effort, self.kind)
+        if not self.reads:
             v.main_kind = "none"
             v.message_lines = [tr("unsupported_1"), tr("unsupported_2")]
             if self.git_files:
                 v.files_title = tr("files_git")
                 v.files = [Path(f).name for f in self.git_files]
-            model_id, effort = self._other_agent_model()
-            v.model, v.version = efforts.display_name(model_id) if model_id else (self.agent.capitalize(), "")
-            v.effort = effort
-            v.effort_level = efforts.dots(model_id, effort, self.agent)
             return v
 
         if self.inferred:
@@ -358,15 +410,23 @@ class PanelModel:
             v.diff = self.diff
         return v
 
-    def _other_agent_model(self) -> Tuple[str, str]:
+    def _other_agent_model(self, data: Optional[claude.SessionData]) -> Tuple[str, str]:
         """(model id, effort) for agents other than Claude Code, when they expose it."""
-        if self.agent == "codex":
+        if self.kind == "codex":
+            if data and data.model:
+                return data.model, data.effort
             path = codex.find_session(self.session_id, self.cwd)
             if path:
                 model, effort = codex.model_and_effort(path)
                 if model:
                     return model, effort
             return codex.configured()
+        if self.kind == "agy":
+            snap_model = (self.session_snap or {}).get("model") or {}
+            model = snap_model.get("id") if isinstance(snap_model, dict) else ""
+            if model:
+                return model, str((self.session_snap or {}).get("effort") or antigravity.effort_of(model))
+            return antigravity.configured_model()
         return "", ""
 
     def _bars(self, data: Optional[claude.SessionData], now: float) -> List[Bar]:
@@ -379,12 +439,15 @@ class PanelModel:
         transcript_newer = data is not None and (data.last_activity_ts or 0) > snap.get("ts", 0) + 5
         if isinstance(ctx, dict) and isinstance(ctx.get("used_percentage"), (int, float)) and not transcript_newer:
             ctx_pct = float(ctx["used_percentage"])
+        if data and data.context_window and not size:
+            size = data.context_window
         if data and data.context_tokens and (ctx_pct is None):
-            window = size if isinstance(size, (int, float)) and size else self._guess_window(data.model, data.context_tokens)
+            model = data.model or (self._other_agent_model(data)[0] if self.kind == "agy" else "")
+            window = size if isinstance(size, (int, float)) and size else self._guess_window(model, data.context_tokens)
             used_tokens = data.context_tokens
             ctx_pct = min(100.0, data.context_tokens / window * 100.0)
             size = window
-        ctx_bar = Bar("ctx", "CTX", ctx_pct if self.agent == "claude" else None)
+        ctx_bar = Bar("ctx", "CTX", ctx_pct if self.reads else None)
         if ctx_pct is not None:
             if not used_tokens and size:
                 used_tokens = ctx_pct / 100.0 * size
@@ -407,7 +470,7 @@ class PanelModel:
                         bar.detail_icon = "reset"
                         bar.detail, bar.detail_sub = self._date_long(float(resets), now)
                         bar.detail_sub = "· " + bar.detail_sub
-            bar.pct = pct if self.agent == "claude" else None
+            bar.pct = pct if self.reads else None
             bars.append(bar)
         return bars
 
@@ -416,6 +479,8 @@ class PanelModel:
         known = statusline.read_windows().get(model or "")
         if isinstance(known, (int, float)) and known > 0:
             return int(known)
+        if "gemini" in (model or "").lower():
+            return 1_048_576
         if "[1m]" in (model or "") or tokens > 200_000:
             return 1_000_000
         return 200_000
