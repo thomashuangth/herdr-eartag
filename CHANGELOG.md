@@ -11,6 +11,11 @@
   and quotas through its statusline (setup wraps it like Claude Code's).
 - Codex: full panel from its session files, with context and 5h/7d quotas.
 - The installed relay is refreshed when a panel starts after an update.
+- Setup installs herdr's session hook in every Claude Code account that lacks it,
+  and a missing hook shows a clickable **▸ Fix** under “session inferred from
+  folder”. Undo removes only the hooks Eartag added; `doctor` lists each account.
+- Open panels reload themselves when the plugin's files change (update or linked
+  dev copy), after checking the new code loads.
 
 ## 0.1.0
 

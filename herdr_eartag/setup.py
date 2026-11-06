@@ -1,4 +1,5 @@
-"""One-click setup: statusline relay (quotas) for Claude Code and Antigravity, and the prefix+i key.
+"""One-click setup: statusline relay (quotas) for Claude Code and Antigravity, herdr's
+session hook in every Claude Code account, and the prefix+i key.
 
 Both steps are idempotent, keep a backup of the file they edit, and can be undone.
 They run only when the user asks: the `setup` action, or the "Enable" line / menu
@@ -11,6 +12,7 @@ import os
 import re
 import shlex
 import shutil
+import subprocess
 import sys
 import tempfile
 from pathlib import Path
@@ -194,6 +196,109 @@ def remove_statusline() -> str:
     return "\n".join(_remove_target(t) for t in targets())
 
 
+# -- herdr session hook ---------------------------------------------------------------
+# herdr learns which Claude session runs in a pane from its own SessionStart hook.
+# `herdr integration install claude` only sets it up for the CLAUDE_CONFIG_DIR of the
+# shell it runs in, so other accounts are left without it and the panel has to guess
+# the session from the folder. Eartag runs herdr's installer once per account (herdr
+# keeps owning its script) and remembers which ones it added, so undo removes only those.
+
+HERDR_HOOK = "herdr-agent-state.sh"
+
+
+def herdr_hooks_path() -> Path:
+    return data_dir() / "herdr-hooks.json"
+
+
+def herdr_hook_installed(folder: Path) -> bool:
+    settings = _load_settings(folder / "settings.json") or {}
+    hooks = settings.get("hooks")
+    entries = hooks.get("SessionStart") if isinstance(hooks, dict) else None
+    for entry in entries if isinstance(entries, list) else []:
+        for hook in (entry.get("hooks") if isinstance(entry, dict) else None) or []:
+            if isinstance(hook, dict) and HERDR_HOOK in str(hook.get("command", "")):
+                return True
+    return False
+
+
+def herdr_hooks_missing() -> List[Path]:
+    return [d for d in claude_dirs() if not herdr_hook_installed(d)]
+
+
+def _added_hooks() -> List[str]:
+    try:
+        data = json.loads(herdr_hooks_path().read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return []
+    return [str(d) for d in data] if isinstance(data, list) else []
+
+
+def _save_added_hooks(dirs: List[str]) -> None:
+    path = herdr_hooks_path()
+    if not dirs:
+        try:
+            path.unlink()
+        except OSError:
+            pass
+        return
+    ensure_private_dir(path.parent)
+    path.write_text(json.dumps(sorted(set(dirs))), encoding="utf-8")
+    os.chmod(path, 0o600)
+
+
+def _herdr_integration(action: str, folder: Path) -> Optional[str]:
+    """Run `herdr integration <action> claude` for one config dir; None when it worked."""
+    try:
+        proc = subprocess.run(
+            [herdr.herdr_bin(), "integration", action, "claude"],
+            env={**os.environ, "CLAUDE_CONFIG_DIR": str(folder)},
+            capture_output=True, text=True, timeout=20, stdin=subprocess.DEVNULL,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        return str(exc)
+    if proc.returncode != 0:
+        return (proc.stderr or proc.stdout).strip()[:200] or "exit {}".format(proc.returncode)
+    return None
+
+
+def install_herdr_hooks() -> str:
+    lines = []
+    added = _added_hooks()
+    for folder in claude_dirs():
+        if herdr_hook_installed(folder):
+            lines.append("Session hook ({}): already installed.".format(folder))
+            continue
+        error = _herdr_integration("install", folder)
+        if error is None and herdr_hook_installed(folder):
+            added.append(str(folder))
+            lines.append("Session hook ({}): herdr now reports the exact session.".format(folder))
+        else:
+            lines.append("Session hook ({}): herdr integration install failed: {}".format(folder, error or "hook not found"))
+    _save_added_hooks(added)
+    return "\n".join(lines)
+
+
+def remove_herdr_hooks() -> str:
+    added = _added_hooks()
+    if not added:
+        return "Session hook: nothing added by Eartag."
+    lines, kept = [], []
+    for folder in added:
+        error = _herdr_integration("uninstall", Path(folder))
+        if error is None:
+            settings_path = Path(folder) / "settings.json"
+            settings = _load_settings(settings_path)
+            if settings and settings.get("hooks") == {}:  # herdr leaves an empty table
+                settings.pop("hooks")
+                _write_json_atomic(settings_path, settings)
+            lines.append("Session hook ({}): removed.".format(folder))
+        else:
+            kept.append(folder)
+            lines.append("Session hook ({}): herdr integration uninstall failed: {}".format(folder, error))
+    _save_added_hooks(kept)
+    return "\n".join(lines)
+
+
 # -- keybinding ---------------------------------------------------------------------
 def _config_text() -> str:
     try:
@@ -259,12 +364,13 @@ def _reload_herdr() -> None:
 
 # -- all -----------------------------------------------------------------------------
 def needs_setup(kind: Optional[str] = None) -> bool:
+    """Quotas or key missing. A missing session hook shows on the "?" line instead."""
     return not statusline_installed(kind) or keybinding_state() == "missing"
 
 
 def run_all() -> List[str]:
-    return [install_statusline(), install_keybinding()]
+    return [install_statusline(), install_herdr_hooks(), install_keybinding()]
 
 
 def undo_all() -> List[str]:
-    return [remove_statusline(), remove_keybinding()]
+    return [remove_statusline(), remove_herdr_hooks(), remove_keybinding()]

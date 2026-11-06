@@ -9,7 +9,7 @@ import sys
 from typing import Any, Iterator, Optional
 
 from . import herdr, prefs
-from .config import Config, config_dir, ensure_private_dir, load_config, state_dir
+from .config import Config, claude_dirs as config_claude_dirs, config_dir, ensure_private_dir, load_config, state_dir
 from .i18n import Tr, detect_language
 from .setup import plugin_id as setup_plugin_id
 
@@ -263,6 +263,9 @@ def cmd_doctor(args) -> int:
     for target in setup.targets():
         print("relay       ", target.kind, target.settings,
               "installed" if setup._target_installed(target) else "missing (run setup)")
+    for folder in config_claude_dirs():
+        print("session hook", folder,
+              "installed" if setup.herdr_hook_installed(folder) else "missing (run setup)")
     print("language    ", cfg.language, "->", _tr(cfg).lang)
     try:
         agents = herdr.agent_list()

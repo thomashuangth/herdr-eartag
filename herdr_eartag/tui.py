@@ -7,12 +7,14 @@ import re
 import select
 import shutil
 import signal
+import subprocess
 import sys
 import termios
 import threading
 import time
 import tty
-from typing import List, Optional
+from pathlib import Path
+from typing import List, Optional, Tuple
 
 from . import herdr, prefs
 from .config import Config, herdr_border_overhead
@@ -25,6 +27,34 @@ MIN_PANEL_W = 30   # below this the full panel is unreadable: show the strip
 MIN_PANEL_H = 18
 MIN_AGENT_W = 60   # never squeeze the agent pane below this when opening
 _MOUSE_RE = re.compile(rb"\x1b\[<(\d+);(\d+);(\d+)([mM])")
+RELOAD_CHECK = 2.0  # seconds between looks at the plugin's own files
+
+# The plugin directory (herdr keeps it at a fixed path across updates).
+PLUGIN_ROOT = Path(__file__).resolve().parents[1]
+
+
+def code_fingerprint(root: Path = PLUGIN_ROOT) -> Optional[Tuple]:
+    """Name, mtime and size of every source file; None while the dir is missing
+    (herdr replacing it during an update)."""
+    try:
+        files = sorted((root / "herdr_eartag").glob("*.py")) + [root / "eartag.py"]
+        return tuple((f.name, f.stat().st_mtime_ns, f.stat().st_size) for f in files)
+    except OSError:
+        return None
+
+
+def code_imports(root: Path = PLUGIN_ROOT) -> bool:
+    """True when the new code loads: a broken update must not take the panel down."""
+    check = "import sys; sys.path.insert(0, sys.argv[1]); import herdr_eartag.cli, herdr_eartag.tui"
+    import tempfile
+    try:
+        # A fresh bytecode cache: a stale .pyc (same size, same second) would hide the change.
+        with tempfile.TemporaryDirectory(prefix="eartag-check-") as cache:
+            proc = subprocess.run([sys.executable, "-X", "pycache_prefix=" + cache, "-c", check, str(root)],
+                                  cwd=str(root), capture_output=True, timeout=10, stdin=subprocess.DEVNULL)
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return proc.returncode == 0
 
 
 class Screen:
@@ -167,6 +197,12 @@ class App:
         self.running = True
         self.resized = False
         self.next_tick = 0.0
+        # Hot reload: when the plugin's files change (herdr plugin update, or edits to
+        # a linked dev copy), the panel re-executes itself in place with the new code.
+        self.code = code_fingerprint()
+        self.code_seen = self.code
+        self.next_code_check = time.time() + RELOAD_CHECK
+        self.reload = False
         # herdr calls (resize, focus, notify, setup) run here so the input loop
         # never stops reading the pane while herdr is busy.
         self._jobs: "queue.Queue" = queue.Queue()
@@ -191,6 +227,8 @@ class App:
         with prefs.locked() as data:
             data["panels"][self.target] = self.me
             data["pids"][self.me] = os.getpid()
+        if os.environ.pop("EARTAG_RELOADED", None):
+            return  # same pane after a hot reload: keep the width the user left it at
         try:
             # No title on the pane border: herdr labels plugin panes with their title.
             herdr.call("pane", "rename", self.me, "--clear")
@@ -234,6 +272,34 @@ class App:
                 herdr.pane_close(self.me)
             except herdr.HerdrError:
                 pass
+
+    def check_code(self, now: float) -> None:
+        """Ask for a reload once the files changed and stayed put for one check."""
+        if now < self.next_code_check:
+            return
+        self.next_code_check = now + RELOAD_CHECK
+        current = code_fingerprint()
+        if current is None or current == self.code:
+            self.code_seen = current
+            return
+        if current != self.code_seen:  # still being written: wait for it to settle
+            self.code_seen = current
+            return
+        if code_imports():
+            self.reload = True
+            self.running = False
+        else:
+            self.code = current  # broken: keep running the old code until the next change
+
+    def exec_new_code(self) -> None:
+        """Replace this process with the updated panel (same pane, pid and env)."""
+        os.environ["EARTAG_RELOADED"] = "1"
+        entry = PLUGIN_ROOT / "eartag.py"
+        try:
+            os.chdir(str(PLUGIN_ROOT))  # the old cwd may be a replaced directory
+            os.execv(sys.executable, [sys.executable, str(entry)] + sys.argv[1:])
+        except OSError:
+            log_error()
 
     # -- actions -----------------------------------------------------------------
     def menu_items(self):
@@ -290,7 +356,7 @@ class App:
             def do_setup() -> None:
                 from . import setup
                 lines = setup.run_all()
-                self.model.needs_setup = setup.needs_setup()
+                self.model.needs_setup = setup.needs_setup(self.model.kind)
                 body = tr("toast.setup_body") if not self.model.needs_setup else " ".join(lines)
                 herdr.notify(tr("toast.setup_done"), body)
             self.later(do_setup)
@@ -468,6 +534,9 @@ class App:
                 if self.model.pane_missing:
                     self.close_self()
                     break
+                self.check_code(now)
+                if self.reload:
+                    break
                 if now >= self.next_tick:  # relative times ("for 4 min") move on
                     self.next_tick = now + 15
                     self.dirty = True
@@ -491,5 +560,7 @@ class App:
                     if not data:
                         break
                     self.parse_input(data)
+        if self.reload:
+            self.exec_new_code()  # only returns if exec failed
         self.unregister()
         return 0

@@ -51,6 +51,7 @@ class View:
     status_label: str = ""
     notif: Optional[Tuple[str, str]] = None        # (text, role)
     inferred_note: str = ""
+    inferred_fix: str = ""                          # clickable: runs setup
     main_kind: str = "now"                          # now | last | none
     main_title: str = ""
     main_right: str = ""
@@ -274,8 +275,12 @@ def _render_panel(v: View) -> Frame:
     if v.notif:
         top.append([(sym["notif"] + " ", v.notif[1] + " b"), (v.notif[0], v.notif[1] + " b")])
         top.append([])
+    fix_y = -1
     if v.inferred_note:
         top.append([(sym["infer"] + " ", "warn b"), (v.inferred_note, "sub")])
+        if v.inferred_fix:
+            fix_y = len(top)
+            top.append([("  " + sym["now"] + " ", "accent b"), (truncate(v.inferred_fix, inner - 4, sym["ell"]), "accent b")])
         top.append([])
 
     # Main block
@@ -448,6 +453,8 @@ def _render_panel(v: View) -> Frame:
     if 0 <= bar_y < v.height:
         for x0, x1, action in bar_hits:
             hits.append(Hit(bar_y, padx + x0, padx + x1, action))
+    if 0 <= fix_y < v.height:
+        hits.append(Hit(fix_y, 0, v.width, "setup"))
     if footnote_line is not None and v.footnote_action:
         fy = footer_start + next(i for i, l in enumerate(footer) if l is footnote_line)
         if 0 <= fy < v.height:

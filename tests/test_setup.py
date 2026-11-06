@@ -18,6 +18,39 @@ sys.path.insert(0, str(ROOT))
 
 from herdr_eartag import cli  # noqa: E402
 
+# Stand-in for `herdr integration install|uninstall claude`: edits the SessionStart
+# hook of $CLAUDE_CONFIG_DIR/settings.json the way herdr does, and logs the call.
+FAKE_HERDR = r'''#!/usr/bin/env python3
+import json, os, sys
+if sys.argv[1:2] != ["integration"] or sys.argv[3:4] != ["claude"]:
+    sys.exit(1)
+folder = os.environ["CLAUDE_CONFIG_DIR"]
+path = os.path.join(folder, "settings.json")
+data = json.load(open(path)) if os.path.exists(path) else {}
+hooks = data.setdefault("hooks", {})
+if sys.argv[2] == "install":
+    hooks["SessionStart"] = [{"hooks": [{"type": "command",
+        "command": "bash '%s/hooks/herdr-agent-state.sh' session" % folder}]}]
+else:
+    hooks.pop("SessionStart", None)
+json.dump(data, open(path, "w"))
+with open(os.path.join(os.path.dirname(sys.argv[0]), "calls.log"), "a") as log:
+    log.write("%s %s\n" % (sys.argv[2], folder))
+'''
+
+
+def fake_herdr(tmp: str) -> str:
+    path = Path(tmp) / "bin" / "herdr"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(FAKE_HERDR)
+    path.chmod(0o755)
+    return str(path)
+
+
+def herdr_calls(tmp: str) -> list:
+    log = Path(tmp) / "bin" / "calls.log"
+    return [line for line in log.read_text().splitlines() if line] if log.exists() else []
+
 
 class SetupTests(unittest.TestCase):
     def test_install_chain_and_remove(self):
@@ -28,6 +61,7 @@ class SetupTests(unittest.TestCase):
                 "XDG_DATA_HOME": str(Path(tmp) / "share"),
                 "XDG_STATE_HOME": str(Path(tmp) / "state"),
                 "XDG_CONFIG_HOME": str(Path(tmp) / "config"),
+                "HERDR_BIN_PATH": fake_herdr(tmp),
             }
             herdr_cfg = Path(env["XDG_CONFIG_HOME"]) / "herdr" / "config.toml"
             herdr_cfg.parent.mkdir(parents=True)
@@ -49,6 +83,8 @@ class SetupTests(unittest.TestCase):
                 self.assertTrue(Path(str(settings) + ".herdr-eartag.bak").exists())
                 self.assertIn('command = "thomashuangth.eartag.toggle"', herdr_cfg.read_text())
                 self.assertTrue(reload.called)
+                from herdr_eartag import setup
+                self.assertTrue(setup.herdr_hook_installed(settings.parent))
                 # Second run is idempotent.
                 self.assertEqual(cli.main(["setup"]), 0)
                 self.assertEqual(json.loads(settings.read_text())["statusLine"]["command"], command)
@@ -146,3 +182,95 @@ class SetupTests(unittest.TestCase):
 if __name__ == "__main__":
     unittest.main()
 
+
+
+class HerdrHookTests(unittest.TestCase):
+    def test_hook_per_account_and_undo_keeps_herdrs_own(self):
+        from herdr_eartag import setup
+        with tempfile.TemporaryDirectory() as tmp:
+            env = {"HOME": tmp, "HERDR_BIN_PATH": fake_herdr(tmp),
+                   "XDG_DATA_HOME": str(Path(tmp) / "share"),
+                   "XDG_STATE_HOME": str(Path(tmp) / "state"),
+                   "XDG_CONFIG_HOME": str(Path(tmp) / "config")}
+            home = Path(tmp)
+            main, work = home / ".claude", home / ".claude-work"
+            (work / "projects").mkdir(parents=True)
+            main.mkdir()
+            # The main account already has herdr's hook (installed by the user).
+            own = {"hooks": {"SessionStart": [{"hooks": [{"type": "command",
+                   "command": "bash '/x/.claude/hooks/herdr-agent-state.sh' session"}]}]}}
+            (main / "settings.json").write_text(json.dumps(own))
+            (work / "settings.json").write_text(json.dumps({"theme": "auto"}))
+            with mock.patch.dict(os.environ, env):
+                os.environ.pop("CLAUDE_CONFIG_DIR", None)
+                self.assertEqual(setup.herdr_hooks_missing(), [work])
+                self.assertIn("herdr now reports", setup.install_herdr_hooks())
+                self.assertEqual(setup.herdr_hooks_missing(), [])
+                self.assertEqual(herdr_calls(tmp), ["install {}".format(work)])
+                setup.install_herdr_hooks()  # idempotent
+                self.assertEqual(len(herdr_calls(tmp)), 1)
+                # Undo removes only what Eartag added, and leaves the file as it was.
+                setup.remove_herdr_hooks()
+                self.assertEqual(json.loads((work / "settings.json").read_text()), {"theme": "auto"})
+                self.assertEqual(json.loads((main / "settings.json").read_text()), own)
+                self.assertEqual(setup.remove_herdr_hooks(), "Session hook: nothing added by Eartag.")
+
+    def test_failed_install_is_reported_not_recorded(self):
+        from herdr_eartag import setup
+        with tempfile.TemporaryDirectory() as tmp:
+            env = {"HOME": tmp, "HERDR_BIN_PATH": str(Path(tmp) / "no-herdr"),
+                   "XDG_DATA_HOME": str(Path(tmp) / "share")}
+            (Path(tmp) / ".claude").mkdir()
+            with mock.patch.dict(os.environ, env):
+                os.environ.pop("CLAUDE_CONFIG_DIR", None)
+                self.assertIn("failed", setup.install_herdr_hooks())
+                self.assertFalse(setup.herdr_hooks_path().exists())
+
+    def test_fix_line_only_when_account_lacks_hook(self):
+        from herdr_eartag.render import View, render
+        frame = render(View(width=40, height=30, inferred_note="session inferred from folder",
+                            inferred_fix="Fix (link this account to herdr)"))
+        rows = [i for i, line in enumerate(frame.lines) if "Fix (link" in "".join(t for t, _ in line)]
+        self.assertEqual(len(rows), 1)
+        self.assertTrue(any(h.action == "setup" and h.y == rows[0] for h in frame.hits))
+        plain = render(View(width=40, height=30, inferred_note="session inferred from folder"))
+        self.assertFalse(any(h.action == "setup" for h in plain.hits))
+
+
+class HotReloadTests(unittest.TestCase):
+    def test_fingerprint_changes_and_import_check(self):
+        from herdr_eartag import tui
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            pkg = root / "herdr_eartag"
+            pkg.mkdir()
+            (root / "eartag.py").write_text("")
+            (pkg / "__init__.py").write_text("")
+            (pkg / "cli.py").write_text("X = 1\n")
+            (pkg / "tui.py").write_text("")
+            before = tui.code_fingerprint(root)
+            self.assertIsNotNone(before)
+            self.assertTrue(tui.code_imports(root))
+            (pkg / "cli.py").write_text("X = (\n")  # broken update
+            self.assertNotEqual(tui.code_fingerprint(root), before)
+            self.assertFalse(tui.code_imports(root))
+            self.assertIsNone(tui.code_fingerprint(root / "gone"))
+
+    def test_waits_for_files_to_settle_then_reloads(self):
+        from herdr_eartag import tui
+        app = tui.App.__new__(tui.App)
+        app.code, app.code_seen = ("a",), ("a",)
+        app.next_code_check, app.reload, app.running = 0, False, True
+        with mock.patch.object(tui, "code_fingerprint", return_value=("b",)), \
+                mock.patch.object(tui, "code_imports", return_value=True):
+            app.check_code(10)  # first sight of the change: wait for it to settle
+            self.assertFalse(app.reload)
+            app.check_code(20)  # unchanged since: reload
+            self.assertTrue(app.reload)
+            self.assertFalse(app.running)
+        app.reload, app.running, app.code, app.code_seen = False, True, ("a",), ("b",)
+        with mock.patch.object(tui, "code_fingerprint", return_value=("b",)), \
+                mock.patch.object(tui, "code_imports", return_value=False):
+            app.check_code(30)  # broken code: keep running the old one
+            self.assertFalse(app.reload)
+            self.assertEqual(app.code, ("b",))

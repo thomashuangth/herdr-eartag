@@ -355,6 +355,10 @@ class PanelModel:
 
         if self.inferred:
             v.inferred_note = tr("inferred_session")
+            if self.kind == "claude" and self.claude_base is not None:
+                from . import setup
+                if not setup.herdr_hook_installed(self.claude_base):
+                    v.inferred_fix = tr("inferred_fix")
         if status == "done":
             v.notif = (tr("your_turn_review"), "done")
         elif status == "blocked":

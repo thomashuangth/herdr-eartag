@@ -62,16 +62,25 @@ This one click:
   statusline, so the panel gets the 5h/7d quotas and the exact context (your
   statusline keeps running and printing as before; each `settings.json` is backed
   up first). Codex needs nothing: its quotas are in its session files;
+- runs `herdr integration install claude` for every Claude config dir that lacks
+  herdr's session hook, so herdr reports the exact session of each account (herdr
+  installs it only for the account of the shell it runs in);
 - binds `prefix+i` to show or hide the panel, if that key is free (your herdr
   `config.toml` is backed up first, and herdr reloads it).
 
 Prefer the terminal? `herdr plugin action invoke thomashuangth.eartag.setup` does
-the same. Undo both with `herdr plugin action invoke thomashuangth.eartag.undo-setup`.
+the same. Undo it all with `herdr plugin action invoke thomashuangth.eartag.undo-setup`
+(it removes only the session hooks Eartag added).
 
 For agents that were already running before the install, focus one and press
 `prefix+i`.
 
 ### Update and uninstall
+
+Open panels pick up an update by themselves: each one re-executes in place a
+couple of seconds after the plugin's files change (also when you edit a copy
+linked with `herdr plugin link`). An update that fails to load is ignored and the
+panel keeps running the previous code.
 
 ```sh
 herdr plugin update thomashuangth.eartag     # herdr 0.9.5+ (on 0.9.3: run the install command again)
@@ -179,8 +188,9 @@ renders the panel of a pane id in your terminal.
 - `prefix+i` does nothing: it was already used in your herdr config, so Eartag left it alone; bind `thomashuangth.eartag.toggle` to another key.
 - Rephrased asks never appear: run the doctor action; it names the backend it found.
 - *“session inferred from folder”*: herdr did not report the Claude session id,
-  so the panel follows the newest transcript of that folder. Run
-  `herdr integration install claude` to make it exact.
+  so the panel follows the newest transcript of that folder. When that account
+  lacks herdr's session hook, the panel shows **▸ Fix** under the note: click it
+  (or run the `setup` action). Sessions started afterwards are exact.
 - The panel opens at 30 columns instead of 40 when the agent would keep fewer
   than 60 columns.
 - Clicking the panel hands the keyboard back to the agent right away, and text
