@@ -11,7 +11,7 @@ from . import antigravity, claude, codex, efforts, gitinfo, herdr, prefs, status
 from .config import Config
 from .i18n import Tr
 from .render import Bar, View
-from .summarize import Summarizer
+from .summarize import Summarizer, context_input, split_context
 
 PANE_POLL = 1.5
 SLOW_POLL = 5.0
@@ -68,6 +68,7 @@ class PanelModel:
         self.diff: Optional[Tuple[int, int]] = None
         self._reply_src = ""       # message last sent for rephrasing while working
         self._reply_req_ts = 0.0
+        self._goals: Dict[str, str] = {}  # transcript path -> latest overall goal from rephrasing
         self.others = 0
         self.status = "unknown"
         self.status_since = time.time()
@@ -233,21 +234,56 @@ class PanelModel:
                         hm=dt.strftime("%H:%M"))
         return label, self.tr("in", d=self.tr.duration(max(0, ts - now)))
 
-    def _fill_recap(self, v: View, text: str, inner: int) -> None:
-        """Current ask: rephrased title + key points when available, raw text otherwise."""
-        v.ask, v.ask_points, v.ask_pending = text, [], False
+    @staticmethod
+    def _context_key(asks: List[claude.Ask], i: int) -> str:
+        """What defines the in-context recap of asks[i]: its text and the end of the
+        agent's message it answers. Earlier asks and the previous goal are soft
+        context, left out so a restarted panel finds its cached recaps."""
+        before = asks[i - 1].reply if i > 0 else ""
+        return asks[i].text + "\x00" + before[-1500:]
+
+    def _goal_key(self) -> str:
+        return str(self.transcript.path) if self.transcript is not None else ""
+
+    def _fill_recap(self, v: View, asks: List[claude.Ask], inner: int, title: str) -> None:
+        """Current ask, read in context: the overall goal, what this message does
+        within it (new work, follow-up, fix, approval, question) and its key points.
+        Raw text when rephrasing is off, plus the agent's question a short answer replies to."""
+        current = asks[-1]
+        before = asks[-2].reply if len(asks) > 1 else ""
+        v.ask, v.ask_points, v.ask_pending, v.ask_kind, v.ask_reply_to = current.text, [], False, "", ""
         v.ask_max_lines = 5
+        v.session_title = self._goals.get(self._goal_key()) or title
         if not self.summarizer:
+            if before and len(current.text.strip()) <= 60:
+                v.ask_reply_to = textutil.last_question(before)
+                v.ask_reply_label = self.tr("answering")
             return
-        recap = self.summarizer.get("recap3", text, inner)
+        key = self._context_key(asks, len(asks) - 1)
+        prompt = context_input(v.session_title, [a.text for a in asks[:-1][-5:]], before, current.text)
+        recap = self.summarizer.get("context", prompt, inner, key_text=key)
         if recap:
-            lines = recap.split("\n")
-            v.ask = lines[0]
-            v.ask_points = [l[2:] for l in lines[1:] if l.startswith("- ")]
+            goal, tag, step, points = split_context(recap)
+            if goal:
+                self._goals[self._goal_key()] = goal
+                v.session_title = goal
+            v.ask = step or current.text
+            v.ask_points = points
+            v.ask_kind = self.tr("step." + tag.lower()) if tag else ""
             v.ask_max_lines = 2
         else:
-            v.ask_pending = self.summarizer.pending("recap3", text, inner)
+            v.ask_pending = self.summarizer.pending("context", key, inner)
             v.ask_max_lines = 4
+
+    def _history_title(self, asks: List[claude.Ask], i: int, room: int, inner: int) -> str:
+        """Subject of an earlier ask: its in-context step when already rephrased
+        (so a past "yes" reads as what it approved), else a short title."""
+        if self.summarizer:
+            recap = self.summarizer.peek("context", self._context_key(asks, i), inner)
+            step = split_context(recap)[2].replace("{", "").replace("}", "") if recap else ""
+            if step:
+                return textutil.short_title(step, room)
+        return self._title(asks[i].text, room)
 
     def _reply(self, text: str, inner: int, working: bool = False) -> str:
         """Agent's latest message, condensed: LLM summary, else its first sentences.
@@ -370,7 +406,7 @@ class PanelModel:
             v.message_lines = [tr("waiting_first_1"), tr("waiting_first_2")]
         else:
             current = asks[-1]
-            self._fill_recap(v, current.text, inner)
+            self._fill_recap(v, asks, inner, data.title if data else "")
             v.main_title = tr("now") if status == "working" else tr("last_ask")
             v.main_right = tr.short(now - current.ts)
             v.main_kind = "now" if status == "working" else "last"
@@ -386,8 +422,6 @@ class PanelModel:
                     v.activity = tr("finished_in", d=tr.short(last - current.ts))
                 else:
                     v.activity = tr("finished")
-            if data and data.title:
-                v.session_title = data.title
             if data and data.last_reply and (data.last_reply_ts or 0) >= current.ts:
                 v.reply_label = tr("progress") if status == "working" else tr("reply")
                 v.reply = self._reply(data.last_reply, inner, working=status == "working")
@@ -403,11 +437,12 @@ class PanelModel:
                 v.tasks_label = tr("tasks")
             v.before_title = tr("before")
             room = inner - 8  # "✓ HH:MM "
-            for ask in reversed(asks[:-1][-3:]):
+            for i in range(len(asks) - 2, max(-1, len(asks) - 5), -1):
+                ask = asks[i]
                 verdict = ""
                 if ask.reply and self.summarizer:  # cached once rephrased: one call per ask
                     verdict, _ = split_verdict(self.summarizer.get("reply3", ask.reply[-4000:], inner) or "")
-                v.before.append((self._clock(ask.ts, now), self._title(ask.text, room), verdict))
+                v.before.append((self._clock(ask.ts, now), self._history_title(asks, i, room, inner), verdict))
         if data and data.files:
             v.files_title = tr("files")
             v.files = list(reversed(list(data.files.keys())))

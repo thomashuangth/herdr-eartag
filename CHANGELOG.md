@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- Rephrasing reads each ask in context: the panel shows the overall work of the
+  conversation (instead of Claude Code's early session title) and what the latest
+  message does within it (new, follow-up, fix, approval, question), so a plain
+  "yes" reads as what it approves. Same number of calls as before. Without
+  rephrasing, a short answer shows the agent's question it replies to.
 - Several Claude Code accounts (`CLAUDE_CONFIG_DIR` aliases such as `claude-lb`):
   transcripts and tasks are found in `~/.claude`, `~/.claude-*` and the new
   `claude_dirs` key; setup installs the relay in each dir and quotas are kept per

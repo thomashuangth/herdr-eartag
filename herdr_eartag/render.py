@@ -58,6 +58,9 @@ class View:
     ask: str = ""
     ask_max_lines: int = 3
     ask_points: List[str] = field(default_factory=list)
+    ask_kind: str = ""           # what the ask does in the work: new, follow-up, fix, approval, question
+    ask_reply_to: str = ""       # the agent's question a short ask answers (rephrasing off)
+    ask_reply_label: str = ""
     session_title: str = ""
     task_now: str = ""
     reply_label: str = ""
@@ -287,14 +290,21 @@ def _render_panel(v: View) -> Frame:
     main: List[Line] = []
     if v.main_kind != "none":
         if v.session_title:
-            # What this conversation is about (Claude's own session title).
+            # What this conversation is about: the goal from rephrasing, else Claude's session title.
             main.append([(sym["session"] + " ", "accent"), (truncate(v.session_title, inner - 2, sym["ell"]), "accent")])
             main.append([])
         # Always the same yellow marker, whatever the state: this is where to look.
-        main.append(_lr([(sym["now"] + " ", "working b"), (v.main_title, "working b")],
-                        [(v.main_right, "sub")], inner))
+        title: Line = [(sym["now"] + " ", "working b"), (v.main_title, "working b")]
+        kind = " " + sym["sep"] + " " + v.ask_kind
+        if v.ask_kind and sum(width(t) for t, _ in title) + width(kind) + width(v.main_right) + 1 <= inner:
+            title.append((kind, "sub"))  # dropped on narrow panels rather than the age
+        main.append(_lr(title, [(v.main_right, "sub")], inner))
         for line in rich_wrap(v.ask, inner, v.ask_max_lines, "text b", "working b", sym["ell"]) if v.ask else []:
             main.append(line)
+        if v.ask_reply_to:
+            text = (v.ask_reply_label + " " if v.ask_reply_label else "") + v.ask_reply_to.replace("{", "").replace("}", "")
+            for i, line in enumerate(rich_wrap(text, inner - 2, 2, "sub", "sub", sym["ell"])):
+                main.append([(sym["act"] + " " if i == 0 else "  ", "sub")] + line)
         for point in v.ask_points[:3]:
             for i, line in enumerate(rich_wrap(point, inner - 2, 2, "text", "accent b", sym["ell"])):
                 main.append([(sym["point"] + " " if i == 0 else "  ", "accent")] + line)

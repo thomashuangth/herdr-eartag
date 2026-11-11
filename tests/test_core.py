@@ -633,3 +633,130 @@ class ImprovementTests(unittest.TestCase):
             self.assertEqual(asked, ["first", "first"])
             m._reply("final", 36, working=False)
             self.assertEqual(m.summarizer.get.call_args_list[-1].args[1], "final")
+
+
+class ContextRecapTests(unittest.TestCase):
+    """The current ask is read in context: overall goal + what this message does."""
+
+    def test_normalize_and_split(self):
+        from herdr_eartag import summarize
+        raw = ("**GOAL:** Quota gauges rework\nSTEP: APPROVE: Validate {stacked bars}\n"
+               "- keep {5h} first\n- b\n- c\n- d")
+        out = summarize.normalize("context", raw, 36)
+        goal, tag, step, points = summarize.split_context(out)
+        self.assertEqual((goal, tag, step), ("Quota gauges rework", "APPROVE", "Validate {stacked bars}"))
+        self.assertEqual(points, ["keep {5h} first", "b", "c"])
+        # A model that forgets the prefixes still gives a usable step.
+        goal, tag, step, points = summarize.split_context(summarize.normalize("context", "Fix {login}", 36))
+        self.assertEqual((goal, tag, step, points), ("", "", "Fix {login}", []))
+        # Unknown tags are dropped, the text is kept.
+        self.assertEqual(summarize.split_context("GOAL: g\nSTEP: MAYBE: do it")[1:3], ("", "MAYBE: do it"))
+        self.assertEqual(summarize.split_context("GOAL: g\nSTEP: fix: do it")[1:3], ("FIX", "do it"))
+
+    def test_context_input(self):
+        from herdr_eartag import summarize
+        body = summarize.context_input("Login rework", ["Fix the login", "x" * 900],
+                                       "a" * 3000 + "Shall I also patch the tests?", "yes go")
+        self.assertIn("Previous goal: Login rework", body)
+        self.assertIn("- Fix the login", body)
+        self.assertNotIn("x" * 400, body)                       # earlier asks are cut
+        self.assertIn("Shall I also patch the tests?", body)    # the tail of the agent's message
+        self.assertNotIn("a" * 2000, body)
+        self.assertTrue(body.rstrip().endswith("yes go"))
+        bare = summarize.context_input("", [], "", "Fix it")
+        self.assertNotIn("Previous goal", bare)
+        self.assertNotIn("Agent's message", bare)
+
+    def test_cache_key_ignores_soft_context(self):
+        from herdr_eartag.summarize import Summarizer
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.dict(os.environ, {"HERDR_PLUGIN_STATE_DIR": tmp}):
+            s = Summarizer("off")
+            s.binary = "/bin/true"
+            with mock.patch.object(s, "call", return_value="GOAL: g\nSTEP: NEW: do") as call:
+                self.assertIsNone(s.get("context", "prompt one", 36, key_text="ask|reply"))
+                self.assertTrue(s.changed.wait(5))
+                self.assertEqual(s.get("context", "prompt two", 36, key_text="ask|reply"), "GOAL: g\nSTEP: NEW: do")
+                self.assertEqual(call.call_count, 1)
+                self.assertIn("prompt one", call.call_args.args[0])
+            self.assertEqual(s.peek("context", "ask|reply", 36), "GOAL: g\nSTEP: NEW: do")
+            self.assertIsNone(s.peek("context", "other", 36))
+
+    def test_last_question(self):
+        self.assertEqual(textutil.last_question("Done.\n\nShould I **also** update `tests`? Or stop."),
+                         "Should I also update tests?")
+        self.assertEqual(textutil.last_question("All good. Want me to push it?"), "Want me to push it?")
+        self.assertEqual(textutil.last_question("Fixed the bug."), "")
+
+    def _model(self, tmp, lines, summarizer=None):
+        from herdr_eartag.config import Config
+        from herdr_eartag.panel import PanelModel
+        cwd = str(Path(tmp) / "proj")
+        folder = Path(tmp) / "projects" / claude.encode_project_dir(cwd)
+        folder.mkdir(parents=True)
+        (folder / "s1.jsonl").write_text("\n".join(lines) + "\n")
+        pane = {"pane_id": "w1:p1", "agent": "claude", "agent_status": "done", "cwd": cwd,
+                "workspace_id": "w1", "agent_session": {"value": "s1"}}
+        with mock.patch("herdr_eartag.herdr.pane_get", return_value=pane), \
+                mock.patch("herdr_eartag.herdr.agent_list", return_value=[]):
+            m = PanelModel("w1:p1", Config(language="en"), Tr("en"))
+            if summarizer is not None:
+                m.summarizer = summarizer
+            m.poll()
+            return m, m.view(40, 40, None)
+
+    def _reply(self, text, ts):
+        return _rec("assistant", ts, message={"model": "claude-opus-5-5", "content": [{"type": "text", "text": text}],
+                                              "usage": {"input_tokens": 100}})
+
+    def _transcript(self):
+        return [
+            _rec("ai-title", aiTitle="Old title"),
+            _user("Rework the quota gauges", "2026-11-02T10:00:00Z"),
+            self._reply("Plan: stacked bars, 5h first. Shall I go ahead?", "2026-11-02T10:01:00Z"),
+            _user("yes go", "2026-11-02T10:02:00Z"),
+        ]
+
+    def test_panel_shows_goal_and_step(self):
+        summarizer = mock.Mock()
+
+        def get(kind, text, width, key_text=None):
+            if kind == "context":
+                return "GOAL: Quota gauges rework\nSTEP: APPROVE: Go with {stacked bars}\n- {5h} first"
+            return None
+        summarizer.get.side_effect = get
+        summarizer.peek.return_value = None
+        summarizer.pending.return_value = False
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.dict(os.environ, {
+                "CLAUDE_CONFIG_DIR": tmp, "XDG_STATE_HOME": tmp, "HERDR_PLUGIN_STATE_DIR": tmp}):
+            m, v = self._model(tmp, self._transcript(), summarizer)
+        self.assertEqual(v.session_title, "Quota gauges rework")   # replaces Claude's ai-title
+        self.assertEqual(v.ask, "Go with {stacked bars}")
+        self.assertEqual(v.ask_points, ["{5h} first"])
+        self.assertEqual(v.ask_kind, "approval")
+        call = [c for c in summarizer.get.call_args_list if c.args[0] == "context"][-1]
+        prompt = call.args[1]
+        self.assertIn("Shall I go ahead?", prompt)        # what the "yes" answers
+        self.assertIn("- Rework the quota gauges", prompt)
+        self.assertIn("Previous goal: Old title", prompt)  # seeded from the ai-title
+        self.assertEqual(call.kwargs["key_text"].split("\x00")[0], "yes go")
+        rows = self._rows(v)
+        self.assertIn("◇ Quota gauges rework", rows)
+        self.assertIn("Go with stacked bars", rows)
+
+    def test_no_llm_short_answer_shows_the_question(self):
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.dict(os.environ, {
+                "CLAUDE_CONFIG_DIR": tmp, "XDG_STATE_HOME": tmp, "HERDR_PLUGIN_STATE_DIR": tmp}):
+            m, v = self._model(tmp, self._transcript())
+        self.assertEqual(v.ask, "yes go")
+        self.assertEqual(v.ask_reply_to, "Shall I go ahead?")
+        self.assertEqual(v.session_title, "Old title")
+        self.assertIn("↳ answering: Shall I go ahead?", self._rows(v))
+
+    def test_render_kind_on_title_line(self):
+        v = render.View(width=40, height=30, project="p", status="done", status_label="DONE",
+                        main_kind="last", main_title="LAST ASK", main_right="4m", ask="Go",
+                        ask_kind="approval")
+        self.assertTrue(any(r.startswith("▸ LAST ASK · approval") and r.endswith("4m") for r in self._rows(v)))
+
+    def _rows(self, v):
+        return ["".join(t for t, _ in l).strip() for l in render.render(v).lines]

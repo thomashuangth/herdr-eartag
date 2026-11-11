@@ -135,3 +135,16 @@ def short_title(text: str, max_width: int) -> str:
             break
         out = candidate
     return (out or truncate(t, max_width - 1, "")).rstrip(_PUNCT) + "…"
+
+
+def last_question(text: str) -> str:
+    """The last question an agent's message asks ('' when it asks none), without
+    markdown: what a short "yes" or "go" from the user answers."""
+    for line in reversed((text or "").splitlines()):
+        line = collapse_ws(line.replace("**", "").replace("__", "").replace("`", "").lstrip("#>*-• "))
+        if "?" not in line:
+            continue
+        sentences = re.findall(r"[^.!?]*\?", line)
+        if sentences:
+            return sentences[-1].strip()
+    return ""

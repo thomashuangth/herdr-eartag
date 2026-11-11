@@ -131,9 +131,16 @@ Without it, Eartag matches the session by the pane's title.
 ## Rephrasing with an LLM
 
 Off by default. Turn it on from the panel menu (`⋯` → *Rephrase asks*)
-or with `summarize` in the config file. When on, the panel shows each ask as a
-short imperative title with its key points, and the agent's latest message as a
-colored verdict plus what changed, with the key words highlighted.
+or with `summarize` in the config file. When on, each ask is read in the context
+of the conversation: the panel shows the overall work going on (it replaces
+Claude Code's session title, which is set early and goes stale), what your latest
+message does within it (*new*, *follow-up*, *fix*, *approval* or *question*) as a
+short imperative with its key points, and the agent's latest message as a colored
+verdict plus what changed, with the key words highlighted. A plain "yes, go" reads
+as what it approves.
+
+When it is off, a short ask that answers a question from the agent shows that
+question under it (`↳ answering: Shall I also patch the tests?`).
 
 **How it connects.** Eartag has no API key and no server. It runs a coding-agent
 CLI you already have and are logged in to, in its non-interactive mode, under
@@ -153,8 +160,11 @@ menu shows a notice saying what is sent and to whom.
 
 **What is sent, and when.**
 
-- The text of each new ask, and of the agent's latest message each time it
-  changes (results are cached on disk, mode `0600`).
+- For each new ask: its text, the end of the agent's message just before it (up to
+  1,500 characters), your five previous asks (300 characters each at most) and the
+  overall goal found so far.
+- The agent's latest message each time it changes. Results are cached on disk,
+  mode `0600`, so each ask is sent once.
 - Nothing else, and nothing at all while rephrasing is off.
 
 **Cost and policies.** Each call counts against your plan's usage (it shows up in

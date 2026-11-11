@@ -12,6 +12,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import shutil
 import subprocess
 import tempfile
@@ -29,16 +30,27 @@ _SYSTEM = (
     "Answer with the label only: no quotes, no preamble, no markdown, no tool use. "
     "Keep the language of the input."
 )
-_RECAP_PROMPT = (
-    "Summarize this request to a coding agent for a {width}-column sidebar, so the "
-    "user knows at a glance what was asked.\n"
-    "Line 1: what is asked, as an imperative, at most {width} characters.\n"
+_CONTEXT_PROMPT = (
+    "Below is where a user stands in a conversation with a coding agent. Summarize it "
+    "for a {width}-column sidebar, so the user sees at a glance the overall work and "
+    "what their latest message does within it.\n"
+    "Line 1: 'GOAL: ' then the overall work of this conversation in 2 to 6 words, at "
+    "most {width} characters. If a previous goal is given, repeat it word for word "
+    "unless the work clearly moved to something else.\n"
+    "Line 2: 'STEP: ' then exactly one tag, ': ', then what the latest message asks, as "
+    "an imperative, at most {chars} characters. Tags: NEW (starts another piece of "
+    "work), CONTINUE (next step or refinement of the current work), FIX (asks to "
+    "correct what the agent did), APPROVE (approves, accepts or answers what the agent "
+    "proposed or asked: say what is approved or answered, from the agent's message, "
+    "never just 'yes'), QUESTION (asks for information or an explanation, no change).\n"
     "Then 0 to 3 lines, each starting with '- ', at most {bullet} characters: the key "
     "specifics only (which page/file/feature, values, constraints). Skip bullets that "
-    "would repeat line 1.\n"
-    "Wrap the 1 or 2 words that matter most on each line (the object, a file, a value) "
-    "in curly braces, like {{this}}. Plain text otherwise.\n\nRequest:\n\n{text}"
+    "would repeat line 2.\n"
+    "On lines 2 and after, wrap the 1 or 2 words that matter most (the object, a file, "
+    "a value) in curly braces, like {{this}}. Plain text otherwise. Write in the "
+    "language of the user's messages.\n\n{text}"
 )
+STEP_TAGS = ("NEW", "CONTINUE", "FIX", "APPROVE", "QUESTION")
 _TITLE_PROMPT = (
     "Give a 2 to 5 word title naming the subject of this request to a coding agent, "
     "at most {chars} characters. Keep the specific nouns (feature, page, file, value); "
@@ -72,14 +84,70 @@ def _cut(text: str, limit: int) -> str:
     return head + "…"
 
 
+def context_input(goal: str, earlier: List[str], before: str, ask: str) -> str:
+    """The situation sent with _CONTEXT_PROMPT: previous goal, earlier asks (cut),
+    the end of the agent's message the latest ask answers, and the latest ask."""
+    parts = []
+    if goal.strip():
+        parts.append("Previous goal: " + " ".join(goal.split()))
+    if earlier:
+        parts.append("Earlier messages from the user, oldest first:\n" + "\n".join(
+            "- " + _cut(" ".join(t.split()), 300) for t in earlier if t.strip()))
+    if before.strip():
+        tail = before.strip()
+        if len(tail) > 1500:
+            tail = "…" + tail[-1500:]
+        parts.append("Agent's message just before the latest one:\n" + tail)
+    parts.append("Latest message from the user:\n" + ask[:4000])
+    return "\n\n".join(parts)
+
+
+def split_context(text: str) -> Tuple[str, str, str, List[str]]:
+    """Normalized context recap -> (goal, tag, step, points). Tag is one of STEP_TAGS
+    or '' when the model gave none or an unknown one."""
+    goal, tag, step, points = "", "", "", []
+    for line in (text or "").split("\n"):
+        upper = line.upper()
+        if upper.startswith("GOAL:"):
+            goal = line[5:].strip()
+        elif upper.startswith("STEP:"):
+            step = line[5:].strip()
+            m = re.match(r"^([A-Za-z]+)\s*:\s*", step)
+            if m and m.group(1).upper() in STEP_TAGS:
+                tag, step = m.group(1).upper(), step[m.end():]
+        elif line.startswith("- "):
+            points.append(line[2:])
+        elif not step:
+            step = line
+    return goal, tag, step, points[:3]
+
+
 def normalize(kind: str, raw: str, width: int) -> str:
     """Clean a model answer. One line for titles; structured lines otherwise:
-    recap/reply = first line + '- ' bullets (+ '? ' question for replies)."""
+    context = 'GOAL: ' line + 'STEP: ' line + '- ' bullets; reply = first line +
+    '- ' bullets + '? ' question."""
     lines = [l.replace("**", "").replace("__", "").strip().strip('"').strip() for l in (raw or "").splitlines()]
     lines = [l.lstrip("*#").strip() for l in lines if l.strip()]
     if not lines:
         return ""
-    if kind not in ("recap3", "reply3"):
+    if kind == "context":
+        goal, step, bullets = "", "", []
+        for l in lines:
+            body = l.lstrip("-•* ").strip()
+            upper = body.upper()
+            if upper.startswith("GOAL:") and not goal:
+                goal = " ".join(body[5:].replace("{", "").replace("}", "").split())
+            elif upper.startswith("STEP:") and not step:
+                step = "STEP: " + body[5:].strip()
+            elif not step and not l.startswith(("-", "•")):
+                step = body
+            elif body:
+                bullets.append("- " + body)
+        out = ["GOAL: " + _cut(goal, width)] if goal else []
+        if step:
+            out.append(_cut(step, width * 3))
+        return "\n".join(out + [_cut(b, width * 2) for b in bullets[:3]]) if step else ""
+    if kind != "reply3":
         # Single-line kinds never carry highlight braces.
         return " ".join(" ".join(lines).replace("{", "").replace("}", "").split())[: width * 3]
     head = lines[0].lstrip("-•* ").strip()
@@ -180,11 +248,15 @@ class Summarizer:
     def _key(kind: str, text: str, width: int) -> str:
         return hashlib.sha256("{}|{}|{}".format(kind, width, text).encode("utf-8")).hexdigest()[:24]
 
-    def get(self, kind: str, text: str, width: int) -> Optional[str]:
-        """Cached summary, or None (and a background request is started)."""
+    def get(self, kind: str, text: str, width: int, key_text: Optional[str] = None) -> Optional[str]:
+        """Cached summary, or None (and a background request is started).
+
+        key_text, when given, is what the cache is keyed on instead of text: the
+        parts of the input that define the result, without soft context that may
+        differ from one panel run to the next."""
         if not self.available or not text.strip():
             return None
-        key = self._key(kind, text, width)
+        key = self._key(kind, text if key_text is None else key_text, width)
         with self._lock:
             if key in self._cache:
                 return self._cache[key]
@@ -193,6 +265,11 @@ class Summarizer:
             self._pending.add(key)
         threading.Thread(target=self._run, args=(key, kind, text, width), daemon=True).start()
         return None
+
+    def peek(self, kind: str, key_text: str, width: int) -> Optional[str]:
+        """Cached summary only: never starts a request."""
+        with self._lock:
+            return self._cache.get(self._key(kind, key_text, width))
 
     def pending(self, kind: str, text: str, width: int) -> bool:
         with self._lock:
@@ -229,10 +306,10 @@ class Summarizer:
                 pass
 
     def _run(self, key: str, kind: str, text: str, width: int) -> None:
-        template = {"title": _TITLE_PROMPT, "reply3": _REPLY_PROMPT, "recap3": _RECAP_PROMPT}[kind]
+        template = {"title": _TITLE_PROMPT, "reply3": _REPLY_PROMPT, "context": _CONTEXT_PROMPT}[kind]
         chars = {"title": width}.get(kind, width * 2 - 4)
         raw = self.call(template.format(chars=chars, chars2=width * 2 - 4, width=width,
-                                        bullet=width - 2, text=text[:4000]))
+                                        bullet=width - 2, text=text[:8000] if kind == "context" else text[:4000]))
         result = normalize(kind, raw, width)
         with self._lock:
             self._pending.discard(key)
